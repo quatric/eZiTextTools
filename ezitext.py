@@ -744,13 +744,21 @@ class ZndDictionary:
 #
 #   AtokNintendo.atd  magic b"ATAD"      Nintendo custom game-term dictionary.
 #   AtokApot.atd      magic 0x800D0002   prediction dictionary (JP-only).
-#   AtokSystem.atd    magic 0xE00A0001   main system dictionary (COMPRESSED).
+#   AtokSystem.atd    magic 0xE00A0001   main system dictionary (character trie).
 #
 # All three store Shift-JIS text keyed by half-width-katakana readings. Format
 # reverse engineered from the ATOK engine in the title's 00000001.app (Ghidra,
-# PowerPC) plus direct analysis of the files. Entries are (reading, surface)
-# pairs. AtokSystem's body is a proprietary compressed stream (decompressed
-# size at +0x20); its decompressor is not yet reversed, so extract raises.
+# PowerPC) plus direct analysis of the files. Entries are (reading, surface) pairs.
+#
+# AtokSystem is NOT compressed: it is a character-indexed trie whose nodes the
+# engine reads by byte offset (no inflate step). Its runtime node format is fully
+# reversed (see atok_system_notes.py) - node = [u16 type][u16 child_count]
+# [(u16 edge, u16 child)...], plus a [char][3-byte] child table; readings are
+# front-coded half-width katakana decoded to hiragana via KANA_TO_HIRAGANA below.
+# What remains for a full System extractor is the on-disk -> in-RAM structure
+# build (the `data` base the engine walks is assembled at load, not a raw file
+# slice), so `atd extract` on System raises for now. The reading decoder is
+# exposed here and verified.
 
 # Shift-JIS byte classes.
 def _sj_kana(b: int) -> bool:   # half-width katakana (single byte)
@@ -770,6 +778,53 @@ _HAS_JP = re.compile(r"[一-鿿぀-ヿ]").search
 
 def _jp_start(ch: str) -> bool:  # kanji, hiragana or katakana
     return ("一" <= ch <= "鿿") or ("぀" <= ch <= "ヿ") or ("ｦ" <= ch <= "ﾝ")
+
+
+# Half-width katakana byte -> full-width hiragana SJIS code, used by AtokSystem's
+# reading decoder. Extracted & verified from the engine table at 0x80255BF8
+# (index = (byte - 0xA6) * 2). See atok_system_notes.py for the full trie format.
+KANA_TO_HIRAGANA = {
+    0xa6: 0x82f0, 0xa7: 0x829f, 0xa8: 0x82a1, 0xa9: 0x82a3, 0xaa: 0x82a5,
+    0xab: 0x82a7, 0xac: 0x82e1, 0xad: 0x82e3, 0xae: 0x82e5, 0xaf: 0x82c1,
+    0xb0: 0x815b, 0xb1: 0x82a0, 0xb2: 0x82a2, 0xb3: 0x82a4, 0xb4: 0x82a6,
+    0xb5: 0x82a8, 0xb6: 0x82a9, 0xb7: 0x82ab, 0xb8: 0x82ad, 0xb9: 0x82af,
+    0xba: 0x82b1, 0xbb: 0x82b3, 0xbc: 0x82b5, 0xbd: 0x82b7, 0xbe: 0x82b9,
+    0xbf: 0x82bb, 0xc0: 0x82bd, 0xc1: 0x82bf, 0xc2: 0x82c2, 0xc3: 0x82c4,
+    0xc4: 0x82c6, 0xc5: 0x82c8, 0xc6: 0x82c9, 0xc7: 0x82ca, 0xc8: 0x82cb,
+    0xc9: 0x82cc, 0xca: 0x82cd, 0xcb: 0x82d0, 0xcc: 0x82d3, 0xcd: 0x82d6,
+    0xce: 0x82d9, 0xcf: 0x82dc, 0xd0: 0x82dd, 0xd1: 0x82de, 0xd2: 0x82df,
+    0xd3: 0x82e0, 0xd4: 0x82e2, 0xd5: 0x82e4, 0xd6: 0x82e6, 0xd7: 0x82e7,
+    0xd8: 0x82e8, 0xd9: 0x82e9, 0xda: 0x82ea, 0xdb: 0x82eb, 0xdc: 0x82ed,
+    0xdd: 0x82f1, 0xde: 0x814a, 0xdf: 0x814b,
+}
+
+
+def kana_reading_to_hiragana(kana: bytes) -> str:
+    """Half-width-katakana reading (with 0xDE/0xDF combiners) -> hiragana.
+
+    Reimplements the reading half of the ATOK record decoder zz_800ee440_.
+    """
+    out = bytearray()
+    i = 0
+    while i < len(kana):
+        code = KANA_TO_HIRAGANA.get(kana[i])
+        if code is None:
+            i += 1
+            continue
+        hi, lo = code >> 8, code & 0xFF
+        nxt = kana[i + 1] if i + 1 < len(kana) else 0
+        if nxt == 0xDE:                       # dakuten
+            if kana[i] == 0xB3:               # う + ゛ -> ヴ (the one katakana case)
+                hi, lo = 0x83, 0x94
+            else:
+                lo += 1
+            i += 1
+        elif nxt == 0xDF:                     # handakuten
+            lo += 2
+            i += 1
+        out += bytes([hi, lo])
+        i += 1
+    return out.decode("shift_jis", "replace")
 
 
 class AtdDictionary:
@@ -798,10 +853,12 @@ class AtdDictionary:
             return self._extract_nintendo()
         if self.variant == self.APOT:
             return self._extract_apot()
-        size = struct.unpack(">I", self.data[0x20:0x24])[0]
         raise NotImplementedError(
-            f"AtokSystem.atd is compressed (decompressed size = 0x{size:X}); "
-            "its decompressor is not yet reversed."
+            "AtokSystem.atd is a character-indexed trie (not compressed). Its "
+            "runtime node format is reversed (see atok_system_notes.py) and the "
+            "reading decoder kana_reading_to_hiragana() is available, but the "
+            "on-disk->RAM structure build is not yet reimplemented, so full "
+            "extraction is not wired up."
         )
 
     # -- AtokNintendo.atd -----------------------------------------------------
